@@ -42,6 +42,7 @@
 #define F_CPU (120000000)       /* 120 MHz */
 #define F_TIM (16000000)        /* 16 MHz  */
 #define UART_BAUD_RATE (115200)
+#define STICK_BUFFER_ZONE (40)
 
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
@@ -58,15 +59,20 @@
 
 
 // Data Package
-struct InputData {
+struct DataPackage {
     uint32_t stickX;
     uint32_t stickY;
     uint8_t pressedButtonS1;
     uint8_t pressedButtonS2;
     uint8_t arm;
     uint8_t dirty;
+    uint8_t dirtyCounter;
     int8_t speed;
 } dataBuffer;
+
+
+volatile uint8_t initializedBluetooth = false;
+volatile uint32_t tickCounter = 0;
 
 
 
@@ -84,7 +90,7 @@ void rn4678SoftwareButton(uint8_t v);
 void rn4678Reset(uint8_t v);
 void rn4678RTS(uint8_t v);
 
-void sendDataPacket(struct InputData data);
+void sendDataPacket(struct DataPackage data);
 void disconnect(void);
 
 void preFlightSerialCommunication(void);
@@ -119,6 +125,13 @@ void isrPadButtonCallback() {
     uint32_t status = GPIOIntStatus(GPIO_PORTL_BASE, true);
     GPIOIntClear(GPIO_PORTL_BASE, PORT_L);
 
+    // Suppress button bouncing
+    static uint32_t lastTickCounter = 0;
+    if ((lastTickCounter + 250) >= tickCounter) {
+        return;
+    }
+    lastTickCounter = tickCounter;
+
     // Status is 2 if button S1 was pressed and 4 if button S2 was pressed.
     // If both buttons are pressed, bit 1 and 2 will be 1 and the value is 6.
     uint8_t pressedButtonS1 = status & (1 << 1);
@@ -148,9 +161,18 @@ void isrStickCallback() {
     boundsY[0] = MIN(boundsY[0], buffer[1]);
     boundsY[1] = MAX(boundsY[1], buffer[1]);
 
-    dataBuffer.stickX = buffer[0];
-    dataBuffer.stickY = buffer[1];
-    dataBuffer.dirty = true;
+    if ((buffer[0] < (dataBuffer.stickX - STICK_BUFFER_ZONE))
+            || (buffer[0] > (dataBuffer.stickX + STICK_BUFFER_ZONE))) {
+        dataBuffer.stickX = buffer[0];
+        dataBuffer.dirty = true;
+    }
+
+    if ((buffer[1] < (dataBuffer.stickY - STICK_BUFFER_ZONE))
+            || (buffer[1] > (dataBuffer.stickY + STICK_BUFFER_ZONE))) {
+        dataBuffer.stickY = buffer[1];
+        dataBuffer.dirty = true;
+    }
+
 }
 
 
@@ -161,6 +183,27 @@ void isrTimerCallback() {
     uint32_t status = TimerIntStatus(TIMER1_BASE, true);
     TimerIntClear(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
     ADCProcessorTrigger(ADC0_BASE, ADC_SEQ);
+
+    // Send package every 100 ms if data has changed
+    if (initializedBluetooth) {
+        dataBuffer.speed += (dataBuffer.pressedButtonS1 ? 1 : 0);
+        dataBuffer.speed -= (dataBuffer.pressedButtonS2 ? 1 : 0);
+
+        dataBuffer.speed = CLAMP(dataBuffer.speed, 0, 15);
+
+        dataBuffer.pressedButtonS1 = false;
+        dataBuffer.pressedButtonS2 = false;
+        dataBuffer.arm = dataBuffer.speed != 0;
+        dataBuffer.dirty = false;
+
+        sendDataPacket(dataBuffer);
+        switchLights(
+                dataBuffer.speed & (1 << 0),
+                dataBuffer.speed & (1 << 1),
+                dataBuffer.speed & (1 << 2),
+                dataBuffer.speed & (1 << 3)
+                );
+    }
 }
 
 
@@ -275,16 +318,17 @@ void printPacket(uint8_t* packet) {
 /**
  * Sends a data packet to the qudro-copter using bluetooth and MultiWii.
  */
-void sendDataPacket(struct InputData data) {
+void sendDataPacket(struct DataPackage data) {
     uint8_t packet[16];
 
     uint8_t arm = dataBuffer.arm;
 
+    /* All values need to be clamped between [1000; 2000] */
     uint16_t roll = (uint16_t) ((data.stickY / 8 - 250) + 1500);
     uint16_t pitch = (uint16_t) ((data.stickX / 8 - 250) + 1500);
     uint16_t yaw = (uint16_t) 1500;
 
-    uint16_t throttle = (uint16_t) (data.speed * 50 + 1000);
+    uint16_t throttle = (uint16_t) (data.speed * 65 + 1000);
 
     /* MultiWii Header */
     packet[0] = (uint8_t) 0x24;
@@ -370,9 +414,10 @@ int main(void) {
     dataBuffer.stickY = 2048;
     dataBuffer.pressedButtonS1 = false;
     dataBuffer.pressedButtonS2 = false;
-    dataBuffer.speed = 0;
+    dataBuffer.speed = 1;
     dataBuffer.arm = false;
     dataBuffer.dirty = false;
+    dataBuffer.dirtyCounter = 0;
 
     /* Set CPU clock speed */
     uint32_t sysClock = SysCtlClockFreqSet(SYSCTL_XTAL_25MHZ | SYSCTL_OSC_MAIN | SYSCTL_USE_PLL | SYSCTL_CFG_VCO_480, F_CPU);
@@ -511,11 +556,10 @@ int main(void) {
     IntMasterEnable();
 
     /* Console Communication */
-    //preFlightSerialCommunication();
     rn4678InitializeBluetooth();
     rn4678Connect();
 
-    struct InputData armBuffer;
+    struct DataPackage armBuffer;
     armBuffer.stickX = 2000;
     armBuffer.stickY = 2000;
     armBuffer.pressedButtonS1 = false;
@@ -523,35 +567,20 @@ int main(void) {
     armBuffer.speed = 0;
     armBuffer.arm = false;
     armBuffer.dirty = false;
+    armBuffer.dirtyCounter = 0;
 
     sleep(15000);
-    uartWriteLine(UART0_BASE, "Sending Packet 1");
+    uartWriteLine(UART0_BASE, "Sending Packet ARM Packet");
     sendDataPacket(armBuffer);
     sleep(1000);
 
+    initializedBluetooth = true;
+
     /* Hold micro-controller state consistent */
     while(true) {
-        ROM_SysCtlDelay(F_CPU / 3 / 10);
+        ROM_SysCtlDelay(F_CPU / 3 / 1000);
 
-        if (dataBuffer.dirty) {
-            dataBuffer.speed += (dataBuffer.pressedButtonS1 ? 1 : 0);
-            dataBuffer.speed -= (dataBuffer.pressedButtonS2 ? 1 : 0);
-
-            dataBuffer.speed = CLAMP(dataBuffer.speed, 0, 15);
-
-            dataBuffer.pressedButtonS1 = false;
-            dataBuffer.pressedButtonS2 = false;
-            dataBuffer.dirty = false;
-            dataBuffer.arm = true;
-
-            sendDataPacket(dataBuffer);
-
-            switchLights(
-                    dataBuffer.speed & (1 << 0),
-                    dataBuffer.speed & (1 << 1),
-                    dataBuffer.speed & (1 << 2),
-                    dataBuffer.speed & (1 << 3)
-                    );
-        }
+        // Increase global counter by one
+        tickCounter++;
     }
 }
