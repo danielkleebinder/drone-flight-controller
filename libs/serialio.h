@@ -15,6 +15,7 @@
 void uartWrite(uint32_t ui32Base, unsigned char* data);
 void uartWriteChar(uint32_t ui32Base, unsigned char c);
 void uartWriteLine(uint32_t ui32Base, unsigned char* data);
+void uartReadChar(uint32_t ui32Base, unsigned char* data);
 void uartReadLine(uint32_t ui32Base, unsigned char* data);
 
 void uartWriteCharNonBlocking(uint32_t ui32Base, unsigned char c);

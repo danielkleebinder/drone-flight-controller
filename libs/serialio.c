@@ -51,6 +51,17 @@ void uartWriteLine(uint32_t ui32Base, unsigned char* data) {
 
 
 /**
+ * Reads a single character from the UART serial port.
+ *
+ * @param ui32Base UART base port.
+ * @param data Result data buffer.
+ */
+void uartReadChar(uint32_t ui32Base, unsigned char* data) {
+    *data = UARTCharGet(ui32Base);
+}
+
+
+/**
  * Reads a line from the given UART serial port.
  *
  * @param ui32Base UART base port.

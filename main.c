@@ -16,6 +16,7 @@
 #include "libs/sleep.h"
 #include "libs/utils.h"
 #include "libs/serialio.h"
+#include "libs/rn4678.h"
 
 #include <math.h>
 #include <string.h>
@@ -64,10 +65,10 @@ struct DataPackage {
     uint32_t stickY;
     uint8_t pressedButtonS1;
     uint8_t pressedButtonS2;
-    uint8_t arm;
     uint8_t dirty;
     uint8_t dirtyCounter;
     int8_t speed;
+    bool arm;
 } dataBuffer;
 
 
@@ -80,20 +81,20 @@ volatile uint32_t tickCounter = 0;
 void switchLights(uint8_t d1, uint8_t d2, uint8_t d3, uint8_t d4);
 void isrPadButtonCallback(void);
 void isrStickCallback(void);
+void isrStickButtonCallback(void);
+
 void isrTimerCallback(void);
+void isrTimerSendPacketCallback(void);
+void isrTimerTickCallback(void);
+
 void isrBluetoothHandler(void);
 
 void rn4678InitializeBluetooth(void);
 void rn4678Connect(void);
 
-void rn4678SoftwareButton(uint8_t v);
-void rn4678Reset(uint8_t v);
-void rn4678RTS(uint8_t v);
-
 void sendDataPacket(struct DataPackage data);
-void disconnect(void);
 
-void preFlightSerialCommunication(void);
+void inFlightSerialCommunication(void);
 
 
 
@@ -127,7 +128,7 @@ void isrPadButtonCallback() {
 
     // Suppress button bouncing
     static uint32_t lastTickCounter = 0;
-    if ((lastTickCounter + 250) >= tickCounter) {
+    if ((lastTickCounter + 180) >= tickCounter) {
         return;
     }
     lastTickCounter = tickCounter;
@@ -172,7 +173,30 @@ void isrStickCallback() {
         dataBuffer.stickY = buffer[1];
         dataBuffer.dirty = true;
     }
+}
 
+
+/**
+ * Callback function for stick button.
+ */
+void isrStickButtonCallback() {
+    uint32_t status = GPIOIntStatus(GPIO_PORTC_BASE, true);
+    GPIOIntClear(GPIO_PORTC_BASE, PORT_C);
+
+    // Suppress button bouncing
+    static uint32_t lastTickCounter = 0;
+    if ((lastTickCounter + 250) >= tickCounter) {
+        return;
+    }
+    lastTickCounter = tickCounter;
+
+    // Toggle Copter Arm
+    dataBuffer.arm = !dataBuffer.arm;
+
+    // Not able to start copter while speed is greater or equal to 3
+    if (dataBuffer.speed >= 3) {
+        dataBuffer.speed = 0;
+    }
 }
 
 
@@ -183,6 +207,27 @@ void isrTimerCallback() {
     uint32_t status = TimerIntStatus(TIMER1_BASE, true);
     TimerIntClear(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
     ADCProcessorTrigger(ADC0_BASE, ADC_SEQ);
+}
+
+
+/**
+ * Callback for the send bluetooth packet system.
+ */
+void isrTimerSendPacketCallback() {
+    uint32_t status = TimerIntStatus(TIMER1_BASE, true);
+    TimerIntClear(TIMER1_BASE, TIMER_TIMB_TIMEOUT);
+
+    static uint8_t internalCounter = 0;
+    internalCounter = (internalCounter + 1) % 8;
+
+    if (!initializedBluetooth) {
+        switchLights(
+                internalCounter == 3 || internalCounter == 4,
+                internalCounter == 2 || internalCounter == 5,
+                internalCounter == 1 || internalCounter == 6,
+                internalCounter == 0 || internalCounter == 7
+                );
+    }
 
     // Send package every 100 ms if data has changed
     if (initializedBluetooth) {
@@ -193,17 +238,36 @@ void isrTimerCallback() {
 
         dataBuffer.pressedButtonS1 = false;
         dataBuffer.pressedButtonS2 = false;
-        dataBuffer.arm = dataBuffer.speed != 0;
         dataBuffer.dirty = false;
 
         sendDataPacket(dataBuffer);
-        switchLights(
-                dataBuffer.speed & (1 << 0),
-                dataBuffer.speed & (1 << 1),
-                dataBuffer.speed & (1 << 2),
-                dataBuffer.speed & (1 << 3)
-                );
+
+        if (!dataBuffer.arm) {
+            switchLights(
+                    internalCounter == 1,
+                    internalCounter == 0,
+                    internalCounter == 1,
+                    internalCounter == 0
+                    );
+        } else {
+            switchLights(
+                    dataBuffer.speed & (1 << 0),
+                    dataBuffer.speed & (1 << 1),
+                    dataBuffer.speed & (1 << 2),
+                    dataBuffer.speed & (1 << 3)
+                    );
+        }
     }
+}
+
+
+/**
+ * Callback function for global system ticks and time measurements.
+ */
+void isrTimerTickCallback() {
+    uint32_t status = TimerIntStatus(TIMER2_BASE, true);
+    TimerIntClear(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+    tickCounter++;
 }
 
 
@@ -221,26 +285,11 @@ void isrBluetoothHandler() {
         if (i >= 32) {
             break;
         }
-        buffer[i++] = (uint8_t) UARTCharGetNonBlocking(UART6_BASE);
+        uartReadByteNonBlocking(UART6_BASE, &buffer[i++]);
     }
 
     rn4678RTS(true);
-    uartWriteLine(UART0_BASE, buffer);
     rn4678RTS(false);
-}
-
-
-void rn4678Reset(uint8_t v) {
-    GPIOPinWrite(GPIO_PORTP_BASE, GPIO_PIN_4, v ? GPIO_PIN_4 : ~GPIO_PIN_4);
-}
-
-
-void rn4678SoftwareButton(uint8_t v) {
-    GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_2, v ? GPIO_PIN_2 : ~GPIO_PIN_2);
-}
-
-void rn4678RTS(uint8_t v) {
-    GPIOPinWrite(GPIO_PORTD_BASE, GPIO_PIN_4, v ? GPIO_PIN_4 : ~GPIO_PIN_4);
 }
 
 
@@ -271,27 +320,21 @@ void rn4678Connect() {
     sleep(500);
 
     // Use \r to complete the command
-    uartWriteLine(UART0_BASE, "  > Restoring Factory Defaults ...");
     uartWriteNonBlocking(UART6_BASE, "SF,1\r");                // Restore factory defaults
     sleep(500);
 
-    uartWriteLine(UART0_BASE, "  > Activating Classical Bluetooth Mode...");
     uartWriteNonBlocking(UART6_BASE, "SG,2\r");                // Classical bluetooth mode
     sleep(500);
 
-    uartWriteLine(UART0_BASE, "  > Activating Simple Pairaing with Pin...");
     uartWriteNonBlocking(UART6_BASE, "SA,1\r");                // Simple pairing with pin
     sleep(500);
 
-    uartWriteLine(UART0_BASE, "  > Rebooting...");
     uartWriteNonBlocking(UART6_BASE, "R,1\r");                 // Restarts the module
     sleep(2000);
 
-    uartWriteLine(UART0_BASE, "  > Entering Command Mode...");
     uartWriteNonBlocking(UART6_BASE, "$$$");                   // Activate command mode
     sleep(500);
 
-    uartWriteLine(UART0_BASE, "  > Using MAC-Address :0006668CB2E2:");
     uartWriteNonBlocking(UART6_BASE, "C,0006668CB2E2\r");      // Transmit MAC-Address of Quadrocopter
     sleep(500);
 
@@ -302,26 +345,11 @@ void rn4678Connect() {
 }
 
 
-void printPacket(uint8_t* packet) {
-    uartWrite(UART0_BASE, "Data: ");
-    int i;
-    for (i = 0; i < 16; i++) {
-        char b[32];
-        sprintf(b, "%d", packet[i]);
-        uartWrite(UART0_BASE, (unsigned char*) b);
-    }
-    uartWriteLine(UART0_BASE, "");
-}
-
-
-
 /**
  * Sends a data packet to the qudro-copter using bluetooth and MultiWii.
  */
 void sendDataPacket(struct DataPackage data) {
     uint8_t packet[16];
-
-    uint8_t arm = dataBuffer.arm;
 
     /* All values need to be clamped between [1000; 2000] */
     uint16_t roll = (uint16_t) ((data.stickY / 8 - 250) + 1500);
@@ -358,7 +386,7 @@ void sendDataPacket(struct DataPackage data) {
     packet[12] = (uint8_t) (yaw >> 8);
 
     /* Quadro Copter Arm */
-    if (arm) {
+    if (data.arm) {
         packet[13] = (uint8_t) 0xD0;
         packet[14] = (uint8_t) 0x07;
     } else {
@@ -371,36 +399,46 @@ void sendDataPacket(struct DataPackage data) {
 
     /* Write Packet */
     uartWriteBytesNonBlocking(UART6_BASE, packet, 16);
-    printPacket(packet);
 }
 
 
 /**
- * Disconnects from the quadro copter.
+ * Communicates with the UART serial port.
  */
-void disconnect() {
-    uartWriteNonBlocking(UART6_BASE, "K,1\r");
-}
-
-
-/**
- * Communicates with the UART serial port before any real controller action happens.
- */
-void preFlightSerialCommunication() {
+void inFlightSerialCommunication() {
     unsigned char data[256];
-    uartWrite(UART0_BASE, "\r\nSome Text: ");
-    uartReadLine(UART0_BASE, data);
 
-    uppercase(data);
+    uartWriteLine(UART0_BASE, "\r\nWelcome to the Serial UART Interface of the Quadro-Copter!\r\n");
+    uartWriteLine(UART0_BASE, "The following commands are available from this CLI:");
+    uartWriteLine(UART0_BASE, "  -> +    Increase Speed by one tick");
+    uartWriteLine(UART0_BASE, "  -> -    Decrease Speed by one tick");
+    uartWriteLine(UART0_BASE, "  -> a    Arm the quadro-copter");
+    uartWriteLine(UART0_BASE, "  -> d    Disarm the quadro-copter");
+    uartWriteLine(UART0_BASE, "  -> x    Exit the command line interface\r\n");
 
-    uartWrite(UART0_BASE, "\r\nUppercase: ");
-    uartWrite(UART0_BASE, data);
+    while (true) {
+        uartWrite(UART0_BASE, "Command: ");
+        uartReadLine(UART0_BASE, data);
+        uartWriteLine(UART0_BASE, "");
 
-    lowercase(data);
+        if (strcmp("+", (const char*) data) == 0) {
+            dataBuffer.pressedButtonS1 = true;
+        }
+        if (strcmp("-", (const char*) data) == 0) {
+            dataBuffer.pressedButtonS2 = true;
+        }
 
-    uartWrite(UART0_BASE, "\r\nLowercase: ");
-    uartWrite(UART0_BASE, data);
-    uartWrite(UART0_BASE, "\r\n");
+        if (strcmp("a", (const char*) data) == 0) {
+            dataBuffer.arm = true;
+        }
+        if (strcmp("d", (const char*) data) == 0) {
+            dataBuffer.arm = false;
+        }
+
+        if (strcmp("x", (const char*) data) == 0) {
+            break;
+        }
+    }
 }
 
 
@@ -414,8 +452,8 @@ int main(void) {
     dataBuffer.stickY = 2048;
     dataBuffer.pressedButtonS1 = false;
     dataBuffer.pressedButtonS2 = false;
-    dataBuffer.speed = 1;
-    dataBuffer.arm = false;
+    dataBuffer.speed = 0;
+    dataBuffer.arm = true;
     dataBuffer.dirty = false;
     dataBuffer.dirtyCounter = 0;
 
@@ -436,20 +474,25 @@ int main(void) {
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOM);        // Bluetooth Wake-Up
 
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);       // System Interrupt Timer
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER2);       // Global Tick Timer
 
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);        // UART Ports
     SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);        // UART Port 0
     SysCtlPeripheralEnable(SYSCTL_PERIPH_UART1);        // UART Port 1
 
-    /* Configure interrupts */
+    /* Configure Pad Buttons Interrupt */
     GPIOPinTypeGPIOInput(GPIO_PORTL_BASE, PORT_L);
     GPIOIntRegister(GPIO_PORTL_BASE, isrPadButtonCallback);
     GPIOIntTypeSet(GPIO_PORTL_BASE, PORT_L, GPIO_FALLING_EDGE);
 
+    /* Configure Joystick Select Button Interrupt*/
+    GPIOPinTypeGPIOInput(GPIO_PORTC_BASE, PORT_C);
+    GPIOIntRegister(GPIO_PORTC_BASE, isrStickButtonCallback);
+    GPIOIntTypeSet(GPIO_PORTC_BASE, PORT_C, GPIO_FALLING_EDGE);
+
     /* Set pins 0 & 1 of GPIO port N to digital output */
     GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, PORT_F);
     GPIOPinTypeGPIOOutput(GPIO_PORTN_BASE, PORT_N);
-    GPIOPinTypeGPIOOutput(GPIO_PORTC_BASE, PORT_C);
 
     /* Activate all lights */
     switchLights(true, true, true, true);
@@ -493,11 +536,26 @@ int main(void) {
     TimerConfigure(TIMER1_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PERIODIC | TIMER_CFG_B_PERIODIC);
     TimerClockSourceSet(TIMER1_BASE, TIMER_CLOCK_PIOSC);
     TimerLoadSet(TIMER1_BASE, TIMER_A, F_TIM / 1000);
+    TimerLoadSet(TIMER1_BASE, TIMER_B, F_TIM / 1000);
     TimerPrescaleSet(TIMER1_BASE, TIMER_A, 100 - 1);
     TimerIntRegister(TIMER1_BASE, TIMER_A, isrTimerCallback);
+    TimerPrescaleSet(TIMER1_BASE, TIMER_B, 100 - 1);
+    TimerIntRegister(TIMER1_BASE, TIMER_B, isrTimerSendPacketCallback);
 
     TimerIntEnable(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+    TimerIntEnable(TIMER1_BASE, TIMER_TIMB_TIMEOUT);
     TimerEnable(TIMER1_BASE, TIMER_A);
+    TimerEnable(TIMER1_BASE, TIMER_B);
+
+    /* Global Tick Timer */
+    TimerConfigure(TIMER2_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_PERIODIC | TIMER_CFG_B_PERIODIC);
+    TimerClockSourceSet(TIMER2_BASE, TIMER_CLOCK_PIOSC);
+    TimerLoadSet(TIMER2_BASE, TIMER_A, F_TIM / 10000);
+    TimerPrescaleSet(TIMER2_BASE, TIMER_A, 10 - 1);
+    TimerIntRegister(TIMER2_BASE, TIMER_A, isrTimerTickCallback);
+
+    TimerIntEnable(TIMER2_BASE, TIMER_TIMA_TIMEOUT);
+    TimerEnable(TIMER2_BASE, TIMER_A);
 
 
     /* Bluetooth Configuration */
@@ -553,6 +611,7 @@ int main(void) {
 
     /* Enables CPU interrupts */
     GPIOIntEnable(GPIO_PORTL_BASE, PORT_L);
+    GPIOIntEnable(GPIO_PORTC_BASE, PORT_C);
     IntMasterEnable();
 
     /* Console Communication */
@@ -570,17 +629,22 @@ int main(void) {
     armBuffer.dirtyCounter = 0;
 
     sleep(15000);
-    uartWriteLine(UART0_BASE, "Sending Packet ARM Packet");
+    uartWriteLine(UART0_BASE, "Sending Initial Arm Packet");
     sendDataPacket(armBuffer);
     sleep(1000);
 
     initializedBluetooth = true;
+    uartWriteLine(UART0_BASE, "Initialization Finished! Ready For Use!");
+    uartWriteLine(UART0_BASE, "\r\nPress # to enter the serial command line interface");
 
-    /* Hold micro-controller state consistent */
+    /* CLI communication and hold micro-controller state consistent */
+    unsigned char commandInput[1];
     while(true) {
-        ROM_SysCtlDelay(F_CPU / 3 / 1000);
+        ROM_SysCtlDelay(F_CPU / 3 / 100);
+        uartReadChar(UART0_BASE, commandInput);
 
-        // Increase global counter by one
-        tickCounter++;
+        if (commandInput[0] == '#') {
+            inFlightSerialCommunication();
+        }
     }
 }

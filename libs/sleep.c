@@ -17,7 +17,7 @@
 
 
 
-uint8_t initialized = false;
+uint8_t initializedSleepTimer = false;
 
 
 /**
@@ -27,7 +27,7 @@ void initializeSleep() {
     SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER0);
     TimerConfigure(TIMER0_BASE, TIMER_CFG_SPLIT_PAIR | TIMER_CFG_A_ONE_SHOT | TIMER_CFG_B_PERIODIC);
     TimerClockSourceSet(TIMER0_BASE, TIMER_CLOCK_PIOSC);
-    initialized = true;
+    initializedSleepTimer = true;
 }
 
 
@@ -38,7 +38,7 @@ void initializeSleep() {
  */
 void sleep(uint16_t ms) {
     // Initialize sleep timer
-    if (!initialized) {
+    if (!initializedSleepTimer) {
         initializeSleep();
     }
 
